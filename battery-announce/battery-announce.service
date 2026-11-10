@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 joshmanpro79-create
+#
+# systemd *user* service: runs battery-announce in the background from login
+# until shutdown. install.sh copies it to ~/.config/systemd/user/.
+# %h below means your home folder.
+
+[Unit]
+Description=Spoken battery announcements
+# Start after the audio system so the first announcement can be heard.
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/bin/battery-announce run
+# If it ever crashes, start it again after 5 seconds.
+Restart=on-failure
+RestartSec=5
+# Slightly lower CPU priority so it never competes with games.
+Nice=5
+
+[Install]
+# default.target = start as part of your normal login session.
+WantedBy=default.target

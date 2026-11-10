@@ -1,0 +1,2031 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 joshmanpro79-create
+#
+# battery-announce: spoken battery announcements for the Steam Frame (SteamOS).
+# See LICENSE for the full license text and README.md for setup and usage.
+"""
+battery-announce: spoken battery announcements for SteamOS.
+
+Runs entirely as your user (no root, no Developer Mode). Reads the kernel's
+power-supply files, speaks with Piper, plays through PipeWire.
+
+Commands:
+  battery-announce run                  main loop (what the service runs)
+  battery-announce status               show raw and corrected readings
+  battery-announce calibrate <PERCENT>  type the % Steam shows right now
+  battery-announce calibrate-gui        calibration window (for the Steam launcher)
+  battery-announce reset-calibration    remove the correction
+  battery-announce say "some text"      speak a test phrase
+  battery-announce test                 speak one of each announcement
+  battery-announce now                  speak a readout right now
+  battery-announce off | on | toggle    mute / unmute automatic announcements
+  battery-announce alerts-gui           alert settings window (for the Steam launcher)
+  battery-announce alerts ...           view / change alerts (`alerts help` for details)
+"""
+
+# How the pieces fit together
+# ---------------------------
+#   config    load/save ~/.config/battery-announce/config.json on top of DEFAULTS
+#   battery   read /sys/class/power_supply: percentage, charging state, time estimates
+#   speech    turn text into a WAV with Piper (cached for repeated phrases) and play it
+#   logic     the Announcer class: decides *when* to speak, polled every few seconds
+#   commands  one function per command-line verb (run, status, calibrate, now, ...)
+#   alerts    editable alert levels and messages, shared by the window and `alerts`
+#   windows   the calibration and alert settings windows launched from Steam
+#
+# Only the Python standard library is used, so nothing has to be installed with pip.
+
+import glob
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+# ---------------------------------------------------------------- paths
+# Everything lives in the user's home folder, following the XDG conventions,
+# so no system files are touched. The environment overrides exist for testing.
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "battery-announce")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "battery-announce")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "battery-announce")
+# Private Python with the Tk window toolkit, installed by install.sh only when
+# SteamOS's own Python can't draw windows. The window commands switch to it.
+GUI_PYTHON = os.path.join(DATA_DIR, "gui-python", "bin", "python3")
+# Where the kernel publishes battery and charger information.
+SYSFS = os.environ.get("BATTERY_ANNOUNCE_SYSFS", "/sys/class/power_supply")
+
+# ---------------------------------------------------------------- defaults
+# Every setting the program understands. config.json only needs to contain the
+# keys you want to change; anything missing falls back to these values.
+
+DEFAULTS = {
+    "enabled": True,                    # False = automatic announcements muted
+    "poll_seconds": 5,                  # how often the battery is checked
+    # Level alerts on battery: spoken once each per discharge as the battery
+    # drops to that level. A blank message uses phrases["level"].
+    "discharge_alerts": [{"level": 40, "message": ""},
+                         {"level": 30, "message": ""},
+                         {"level": 20, "message": ""}],
+    # Level alerts while charging: spoken once each per charge as the battery
+    # rises to that level. A blank message uses phrases["charge_level"].
+    "charge_alerts": [],
+    "every_percent_below": 15,          # below this, every 1% drop is spoken
+    "announce_plug_in": True,
+    "plug_in_delay_seconds": 8,         # wait for the charge rate to settle first
+    "announce_unplug": True,
+    "announce_full": True,
+    # Percentage source: "capacity" (kernel's capacity file) or
+    # "charge_ratio" (charge_now / charge_full). Calibration picks one.
+    "percent_source": "capacity",
+    # Calibration correction: announced % = raw % * percent_scale + percent_offset
+    "percent_scale": 1.0,
+    "percent_offset": 0.0,
+    # Reminders to calibrate, spoken on battery until a calibration lands near each level.
+    "calibration_prompts": True,
+    "calibration_prompt_levels": [80, 60, 40, 20],
+    # Saved readings: each is {"steam": %, "capacity": %, "charge_ratio": %}.
+    "calibration_points": [],
+    # Everything that is spoken. {p} = percent, {eta} = optional time sentence,
+    # {t} = a duration such as "1 hour 15 minutes".
+    "phrases": {
+        "level": "Battery {p} percent.",
+        "charge_level": "{p} percent charged.",
+        "low": "Battery low. {p} percent.",
+        "critical": "Battery critical. {p} percent.",
+        "critical_at_or_below": 5,      # switch from "low" to "critical" wording here
+        "calibrate": "Battery {p} percent. Calibration requested for accuracy. Please open Battery Calibrate.",
+        "plug_in": "Charging. {p} percent. {eta}",
+        "plug_in_eta": "About {t} to full.",
+        "plug_in_full": "Charger connected. Fully charged.",
+        "unplug": "On battery. {p} percent.",
+        "full": "Fully charged.",
+        "readout_charging": "Charging. {p} percent.{eta}",
+        "readout_eta_full": " Estimated {t} to full.",
+        "readout_discharging": "Discharging. {p} percent.{eta}",
+        "readout_eta_empty": " Estimated {t} remaining.",
+        "readout_full": "Fully charged. 100 percent.",
+        "readout_plugged_idle": "Plugged in, not charging. {p} percent.",
+        "muted": "Battery announcements off.",
+        "unmuted": "Battery announcements on.",
+    },
+    "piper_bin": "",                    # blank = find Piper automatically
+    "voice_model": "",                  # blank = first .onnx voice in the data folder
+    "length_scale": 1.0,                # speech speed: above 1.0 is slower
+    "volume": 1.0,
+}
+
+
+# ---------------------------------------------------------------- config
+
+def deep_merge(base, over):
+    """Return `base` updated with `over`, merging nested dicts (e.g. "phrases")
+    so a config file can change one phrase without repeating the others."""
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config():
+    """Load config.json merged over DEFAULTS. A missing or broken file never
+    stops the program; it just runs with the defaults."""
+    try:
+        with open(CONFIG_PATH) as f:
+            raw = json.load(f)
+        # Older versions stored plain levels as "discharge_thresholds".
+        if "discharge_thresholds" in raw and "discharge_alerts" not in raw:
+            raw["discharge_alerts"] = [{"level": l, "message": ""} for l in raw["discharge_thresholds"]]
+        return deep_merge(DEFAULTS, raw)
+    except FileNotFoundError:
+        return deep_merge(DEFAULTS, {})
+    except Exception as e:
+        log(f"config error ({e}); using defaults")
+        return deep_merge(DEFAULTS, {})
+
+
+def save_config_values(values):
+    """Write the given keys into config.json, keeping every other key the user
+    set. A value of None removes that key, so its default applies again. Writes to a temp file and renames it, so a crash mid-write can't leave
+    a half-written config behind. The running service notices the new file
+    (by its modification time) and reloads it."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    current = {}
+    try:
+        with open(CONFIG_PATH) as f:
+            current = json.load(f)
+    except Exception:
+        pass
+    for k, v in values.items():
+        if v is None:
+            current.pop(k, None)        # None = remove, so the default applies again
+        else:
+            current[k] = v
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(current, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def log(msg):
+    """Timestamped line on stdout; under systemd it ends up in the journal."""
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+# ---------------------------------------------------------------- battery
+
+def rd(path):
+    """Read a sysfs file as stripped text, or None if it doesn't exist."""
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def rd_num(path):
+    """Read a sysfs file as a number, or None if missing or not numeric."""
+    v = rd(path)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def supplies():
+    """Yield (folder, type) for each power supply that belongs to the device
+    itself, such as the main battery or the charger input."""
+    for d in sorted(glob.glob(os.path.join(SYSFS, "*"))):
+        # Skip controllers, mice, headsets etc. (scope "Device").
+        if (rd(os.path.join(d, "scope")) or "").lower() == "device":
+            continue
+        yield d, rd(os.path.join(d, "type")) or ""
+
+
+def find_battery():
+    """Folder of the main battery, preferring names like BAT0/BAT1."""
+    bats = [d for d, t in supplies() if t == "Battery"]
+    bats.sort(key=lambda d: (not os.path.basename(d).upper().startswith("BAT"), d))
+    return bats[0] if bats else None
+
+
+def external_power_online():
+    """True/False if a Mains/USB supply reports online, None if none exist."""
+    found = False
+    for d, t in supplies():
+        if t in ("Mains", "USB", "USB_C", "USB_PD", "USB_PD_DRP"):
+            v = rd(os.path.join(d, "online"))
+            if v is None:
+                continue
+            found = True
+            if v.strip() == "1":
+                return True
+    return False if found else None
+
+
+def raw_percents(bat):
+    """The battery level as the kernel reports it, before any calibration.
+
+    Returns up to two readings, because they can disagree slightly:
+      "capacity"      the kernel's own percentage file
+      "charge_ratio"  charge_now / charge_full (or energy_*), computed here
+    Calibration later picks whichever one tracks Steam's figure better.
+    """
+    out = {}
+    cap = rd_num(os.path.join(bat, "capacity"))
+    if cap is not None:
+        out["capacity"] = cap
+    for now_n, full_n in (("charge_now", "charge_full"), ("energy_now", "energy_full")):
+        now = rd_num(os.path.join(bat, now_n))
+        full = rd_num(os.path.join(bat, full_n))
+        if now is not None and full:
+            out["charge_ratio"] = max(0.0, min(100.0, now / full * 100.0))
+            break
+    return out
+
+
+def read_state(cfg):
+    """One snapshot of the battery, with the calibration correction applied.
+
+    Returns a dict (or None if no battery is found):
+      pct      the corrected whole-number percentage that gets announced
+      raw      the uncorrected reading from the chosen source
+      status   kernel status text: Charging, Discharging, Full, Not charging...
+      plugged  True when a charger is connected
+      ttf_min / tte_min  minutes to full / to empty, or None if unknown
+    """
+    bat = find_battery()
+    if not bat:
+        return None
+    raws = raw_percents(bat)
+    # Use the configured source if this battery has it, otherwise whatever exists.
+    src = cfg["percent_source"] if cfg["percent_source"] in raws else ("capacity" if "capacity" in raws else next(iter(raws), None))
+    if src is None:
+        return None
+    raw = raws[src]
+    status = rd(os.path.join(bat, "status")) or "Unknown"
+    # Apply the calibration line, then clamp to 0-100 and round.
+    pct = raw * float(cfg["percent_scale"]) + float(cfg["percent_offset"])
+    pct = int(round(max(0.0, min(100.0, pct))))
+    if status == "Full":
+        pct = 100
+    # Prefer the charger's own "online" flag; fall back to the battery status
+    # on hardware that doesn't expose a separate charger entry.
+    ext = external_power_online()
+    if ext is None:
+        plugged = status in ("Charging", "Full", "Not charging")
+    else:
+        plugged = ext or status in ("Charging", "Full")
+    return {
+        "bat": bat, "status": status, "plugged": plugged, "pct": pct,
+        "raw": raw, "raws": raws, "source": src,
+        "ttf_min": time_to_full_minutes(bat),
+        "tte_min": time_to_empty_minutes(bat),
+    }
+
+
+def time_to_full_minutes(bat):
+    """Minutes until full: the kernel's own estimate if it gives one, otherwise
+    the remaining charge divided by the current charging rate."""
+    t = rd_num(os.path.join(bat, "time_to_full_now")) or rd_num(os.path.join(bat, "time_to_full_avg"))
+    if t and t > 0:
+        return t / 60.0                 # kernel reports seconds
+    for now_n, full_n, rate_n in (("charge_now", "charge_full", "current_now"),
+                                  ("energy_now", "energy_full", "power_now")):
+        now = rd_num(os.path.join(bat, now_n))
+        full = rd_num(os.path.join(bat, full_n))
+        rate = rd_num(os.path.join(bat, rate_n))
+        if now is not None and full and rate:
+            rate = abs(rate)            # sign convention differs between drivers
+            if rate > 0 and full > now:
+                mins = (full - now) / rate * 60.0
+                if 0 < mins < 24 * 60:  # ignore nonsense from a near-zero rate
+                    return mins
+    return None
+
+
+def time_to_empty_minutes(bat):
+    """Minutes until empty, worked out the same way as time_to_full_minutes."""
+    t = rd_num(os.path.join(bat, "time_to_empty_now")) or rd_num(os.path.join(bat, "time_to_empty_avg"))
+    if t and t > 0:
+        return t / 60.0
+    for now_n, rate_n in (("charge_now", "current_now"), ("energy_now", "power_now")):
+        now = rd_num(os.path.join(bat, now_n))
+        rate = rd_num(os.path.join(bat, rate_n))
+        if now and rate:
+            rate = abs(rate)
+            if rate > 0:
+                mins = now / rate * 60.0
+                if 0 < mins < 48 * 60:
+                    return mins
+    return None
+
+
+# The running service records the measured rate of change here, so a one-off
+# readout (a separate process) can still estimate time when the kernel can't.
+RATE_PATH = os.path.join(CACHE_DIR, "rate.json")
+
+
+def saved_rate():
+    """Percent per minute measured by the running service (+ charging, - draining)."""
+    try:
+        with open(RATE_PATH) as f:
+            d = json.load(f)
+        if time.time() - d["at"] < 600:     # only trust it if under 10 minutes old
+            return d["rate"], d["plugged"]
+    except Exception:
+        pass
+    return None, None
+
+
+# ---------------------------------------------------------------- calibration reminders
+# Until a calibration has been saved near each reminder level (80/60/40/20 by
+# default), the announcer asks for one when the battery drops past that level.
+# A calibration clears the reminder closest to the level it was taken at.
+
+def nearest_level(levels, value):
+    """Closest reminder level to a calibration reading (ties go to the higher level)."""
+    return min(levels, key=lambda l: (abs(l - value), -l)) if levels else None
+
+
+def calibration_levels_done(cfg):
+    """Reminder levels already covered by a calibration.
+
+    Stored in config once known; for setups calibrated before reminders
+    existed, each saved calibration point covers its nearest level.
+    """
+    levels = [int(l) for l in cfg.get("calibration_prompt_levels", [])]
+    if "calibration_levels_done" in cfg:
+        return sorted({int(l) for l in cfg["calibration_levels_done"] if int(l) in levels}, reverse=True)
+    return sorted({nearest_level(levels, p["steam"]) for p in cfg.get("calibration_points", [])
+                   if isinstance(p, dict) and "steam" in p and levels}, reverse=True)
+
+
+def pending_prompt_levels(cfg):
+    """Reminder levels still waiting for a calibration, highest first."""
+    if not cfg.get("calibration_prompts", True):
+        return []
+    done = set(calibration_levels_done(cfg))
+    return [int(l) for l in sorted(cfg.get("calibration_prompt_levels", []), reverse=True)
+            if int(l) not in done]
+
+
+# ---------------------------------------------------------------- alert levels
+# The level alerts can be edited in the Battery Alerts window, so they are read
+# through these helpers, which tidy up whatever is in the config file.
+
+def fill(template, **values):
+    """Fill {p}, {eta} and {t} placeholders in a message.
+
+    Plain text replacement instead of str.format, so a message typed in the
+    settings window can contain any other braces without causing an error.
+    """
+    out = str(template)
+    for k, v in values.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+
+def _alert_list(items, default_message):
+    """Normalize a list of alerts to [(level, message)], dropping invalid or
+    duplicate levels. Accepts {"level": 40, "message": "..."} or a bare 40."""
+    seen, out = set(), []
+    for it in items or []:
+        if isinstance(it, dict):
+            level, msg = it.get("level"), (it.get("message") or "").strip()
+        else:
+            level, msg = it, ""
+        try:
+            level = int(level)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= level <= 99 and level not in seen:
+            seen.add(level)
+            out.append((level, msg or default_message))
+    return out
+
+
+def discharge_alerts(cfg):
+    """On-battery alerts as [(level, message)], highest level first."""
+    return sorted(_alert_list(cfg.get("discharge_alerts"), cfg["phrases"]["level"]), reverse=True)
+
+
+def charge_alerts(cfg):
+    """Charging alerts as [(level, message)], lowest level first."""
+    return sorted(_alert_list(cfg.get("charge_alerts"), cfg["phrases"]["charge_level"]))
+
+
+# ---------------------------------------------------------------- speech
+
+def find_piper(cfg):
+    """Path to the Piper program: the configured one, the copy install.sh
+    unpacked, a Python-venv fallback install, or one on the PATH."""
+    cands = [cfg.get("piper_bin"),
+             os.path.join(DATA_DIR, "piper", "piper"),
+             os.path.join(DATA_DIR, "venv", "bin", "piper"),
+             shutil.which("piper")]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def find_model(cfg):
+    """Path to the Piper voice (.onnx file); the first one found unless configured."""
+    if cfg.get("voice_model") and os.path.isfile(cfg["voice_model"]):
+        return cfg["voice_model"]
+    models = sorted(glob.glob(os.path.join(DATA_DIR, "voices", "*.onnx")))
+    return models[0] if models else None
+
+
+def find_player():
+    """First available audio player, preferring PipeWire's own tools."""
+    for p in ("pw-play", "pw-cat", "paplay", "aplay"):
+        path = shutil.which(p)
+        if path:
+            return p, path
+    return None, None
+
+
+def synth(text, cfg, cacheable):
+    """Turn text into a WAV file with Piper and return its path (None on failure).
+
+    Fixed phrases ("Battery 40 percent.") are cached by a hash of the text,
+    voice and speed, so after the first time they play instantly. Phrases that
+    change every time (with a time estimate) go to a temp file instead.
+    """
+    piper, model = find_piper(cfg), find_model(cfg)
+    if not piper or not model:
+        log("Piper or voice model not found; run install.sh again")
+        return None
+    key = hashlib.sha1(f"{text}|{model}|{cfg['length_scale']}".encode()).hexdigest()[:16]
+    if cacheable:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        out = os.path.join(CACHE_DIR, key + ".wav")
+        if os.path.isfile(out) and os.path.getsize(out) > 44:   # 44 bytes = empty WAV header
+            return out
+    else:
+        fd, out = tempfile.mkstemp(suffix=".wav", prefix="battery-announce-")
+        os.close(fd)
+    cmd = [piper, "-m", model, "-f", out, "--length_scale", str(cfg["length_scale"])]
+    try:
+        # Piper reads the text on stdin. It runs from its own folder so it finds
+        # the libraries bundled next to it.
+        r = subprocess.run(cmd, input=text.encode(), stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, timeout=30,
+                           cwd=os.path.dirname(piper))
+        if r.returncode != 0:
+            # Newer piper builds spell the option differently; retry without it.
+            r = subprocess.run(cmd[:5], input=text.encode(), stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=30, cwd=os.path.dirname(piper))
+        if r.returncode != 0 or not os.path.isfile(out):
+            log("piper failed: " + r.stderr.decode(errors="replace")[-300:])
+            return None
+    except Exception as e:
+        log(f"piper error: {e}")
+        return None
+    return out
+
+
+def play(wav, cfg):
+    """Play a WAV file and wait for it to finish, using whichever player exists.
+    Each player takes its volume in a different form, hence the branches."""
+    name, path = find_player()
+    if not path:
+        log("no audio player found (pw-play/paplay/aplay)")
+        return
+    vol = float(cfg.get("volume", 1.0))
+    if name in ("pw-play", "pw-cat"):
+        cmd = [path] + (["--playback"] if name == "pw-cat" else []) + [f"--volume={vol}", wav]
+    elif name == "paplay":
+        cmd = [path, f"--volume={int(max(0, min(1.5, vol)) * 65536)}", wav]   # 65536 = 100%
+    else:
+        cmd = [path, "-q", wav]         # aplay has no volume option
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    except Exception as e:
+        log(f"playback error: {e}")
+
+
+def speak(text, cfg, cacheable=True):
+    """Say `text` out loud: synthesize, play, and tidy up any temp file.
+    BATTERY_ANNOUNCE_DRYRUN=1 only logs the text (used for testing)."""
+    log("say: " + text)
+    if os.environ.get("BATTERY_ANNOUNCE_DRYRUN"):
+        return
+    wav = synth(text, cfg, cacheable)
+    if wav:
+        play(wav, cfg)
+        if not cacheable:
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
+
+
+def fmt_duration(mins):
+    """Minutes as speakable text rounded to 5 minutes, e.g. "1 hour 15 minutes".
+    Returns None for under 2 minutes, where an estimate isn't worth saying."""
+    m = int(round(mins / 5.0)) * 5
+    if m < 5:
+        return "5 minutes" if mins >= 2 else None
+    h, m = divmod(m, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} hour" + ("s" if h != 1 else ""))
+    if m:
+        parts.append(f"{m} minutes")
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------- logic
+
+class Announcer:
+    """Decides when to speak. The service calls tick() every few seconds with a
+    fresh battery snapshot; the announcer compares it with what it has seen and
+    said so far.
+
+    Rules:
+      - on battery: level alerts (40/30/20 by default) once each, then every 1% below 15
+      - while charging: charging level alerts (none by default) once each
+      - calibration reminders at their levels while still pending
+      - charger plugged in: "Charging, NN percent, about T to full"
+      - charger removed: "On battery, NN percent"
+      - reaches 100% while charging: "Fully charged"
+    Every level is spoken once per discharge, so a reading that wobbles up and
+    down doesn't repeat itself.
+    """
+
+    def __init__(self, cfg):
+        """Start with no history: the first tick() just learns the current state."""
+        self.cfg = cfg
+        self.ph = cfg["phrases"]
+        self.plugged = None          # last confirmed plug state
+        self.candidate = None        # plug state seen once, awaiting confirmation
+        self.done_thresholds = set() # discharge alert levels already spoken this discharge
+        self.done_charge = set()     # charging alert levels already spoken this charge
+        self.last_pct = None         # latest announced %, used when settings change
+        self.done_prompts = set()    # calibration reminders already given this discharge
+        self.last_low = None         # lowest % spoken in the every-1% zone
+        self.full_spoken = False     # "Fully charged" already said this charge
+        self.pending_plug_at = None  # when to speak the delayed plug-in message
+        self.last_tick = time.monotonic()
+        self.samples = []            # (monotonic, raw %, plugged) for rate estimates
+        self.rate_written = 0        # when RATE_PATH was last updated
+
+    def say(self, text, cacheable=True):
+        """Speak unless announcements are muted (muted messages are only logged)."""
+        if self.cfg.get("enabled", True):
+            speak(text, self.cfg, cacheable)
+        else:
+            log("muted: " + text)
+
+    def track_rate(self, st, now):
+        """Keep 15 minutes of readings and, once a minute, save the measured
+        percent-per-minute to RATE_PATH for the manual readout to use."""
+        if self.samples and self.samples[-1][2] != st["plugged"]:
+            self.samples = []        # plug state changed: old rate no longer applies
+        self.samples.append((now, st["raw"], st["plugged"]))
+        self.samples = [x for x in self.samples if now - x[0] <= 900]
+        if now - self.rate_written >= 60 and len(self.samples) >= 2:
+            dt = (self.samples[-1][0] - self.samples[0][0]) / 60.0
+            if dt >= 3:              # need at least 3 minutes of data
+                rate = (self.samples[-1][1] - self.samples[0][1]) / dt
+                try:
+                    os.makedirs(CACHE_DIR, exist_ok=True)
+                    with open(RATE_PATH, "w") as f:
+                        json.dump({"at": time.time(), "rate": rate, "plugged": st["plugged"]}, f)
+                    self.rate_written = now
+                except OSError:
+                    pass
+
+    def level_phrase(self, p):
+        """Wording for a level announcement: normal, low or critical."""
+        if p <= int(self.ph["critical_at_or_below"]):
+            return fill(self.ph["critical"], p=p)
+        if p < int(self.cfg["every_percent_below"]):
+            return fill(self.ph["low"], p=p)
+        return fill(self.ph["level"], p=p)
+
+    def reset_discharge(self, pct):
+        """Start a new discharge at `pct`. Thresholds and reminders at or above
+        the current level count as already passed, so unplugging at 55% doesn't
+        immediately announce 80% or 60%."""
+        self.done_thresholds = {l for l, _ in discharge_alerts(self.cfg) if l >= pct}
+        self.done_prompts = {l for l in self.cfg["calibration_prompt_levels"] if l >= pct}
+        self.last_low = pct if pct < int(self.cfg["every_percent_below"]) else None
+
+    def reset_charge(self, pct):
+        """Start a new charge at `pct`: charging alerts at or below the current
+        level count as already passed."""
+        self.done_charge = {l for l, _ in charge_alerts(self.cfg) if l <= pct}
+
+    def settings_changed(self, old_cfg):
+        """Called after config.json is reloaded. Alert levels that are new and
+        already behind us are marked as passed, so adding a 50% alert while at
+        45% doesn't fire it straight away."""
+        if self.last_pct is None:
+            return
+        pct = self.last_pct
+        old_d = {l for l, _ in discharge_alerts(old_cfg)}
+        old_c = {l for l, _ in charge_alerts(old_cfg)}
+        self.done_thresholds |= {l for l, _ in discharge_alerts(self.cfg) if l not in old_d and l >= pct}
+        self.done_charge |= {l for l, _ in charge_alerts(self.cfg) if l not in old_c and l <= pct}
+
+    def tick(self, st):
+        """Handle one battery snapshot (see read_state) and speak if needed."""
+        now = time.monotonic()
+        resumed = now - self.last_tick > 60   # woke from sleep
+        self.last_tick = now
+        if resumed:
+            self.samples = []
+        self.track_rate(st, now)
+        pct, plugged = st["pct"], st["plugged"]
+        self.last_pct = pct
+
+        # First snapshot after start-up: just learn the state. Stay quiet unless
+        # the battery is already in the low zone, which is worth hearing at boot.
+        if self.plugged is None:
+            self.plugged = plugged
+            if plugged:
+                self.full_spoken = pct >= 100
+                self.reset_charge(pct)
+            else:
+                self.reset_discharge(pct)
+                if pct < int(self.cfg["every_percent_below"]):
+                    self.say(self.level_phrase(pct))
+            return
+
+        # Debounce: a plug change must be seen on two polls in a row.
+        # (After waking from sleep a single reading is trusted straight away.)
+        if plugged != self.plugged:
+            if self.candidate is plugged or resumed:
+                self.candidate = None
+                self.plugged = plugged
+                self.on_plug_change(st)
+            else:
+                self.candidate = plugged
+            return
+        self.candidate = None
+
+        if plugged:
+            # Delayed plug-in message, then "Fully charged" once at 100%.
+            if self.pending_plug_at and now >= self.pending_plug_at:
+                self.pending_plug_at = None
+                self.announce_plug_in(st)
+            elif (self.cfg["announce_full"] and not self.full_spoken and not self.pending_plug_at
+                  and (pct >= 100 or st["status"] == "Full")):
+                self.full_spoken = True
+                self.say(self.ph["full"])
+            elif not self.pending_plug_at:
+                self.check_charging(pct)
+            return
+
+        self.check_discharge(pct)
+
+    def on_plug_change(self, st):
+        """A confirmed plug-in or unplug."""
+        pct = st["pct"]
+        if st["plugged"]:
+            # Charging: clear the discharge memory so the next discharge starts fresh.
+            self.done_thresholds = set()
+            self.done_prompts = set()
+            self.last_low = None
+            self.full_spoken = False
+            self.reset_charge(pct)
+            if self.cfg["announce_plug_in"]:
+                # Speak a few seconds later, once the charge rate (and so the
+                # time-to-full estimate) has settled.
+                self.pending_plug_at = time.monotonic() + float(self.cfg["plug_in_delay_seconds"])
+        else:
+            self.pending_plug_at = None
+            self.reset_discharge(pct)
+            if self.cfg["announce_unplug"]:
+                self.say(fill(self.ph["unplug"], p=pct))
+
+    def announce_plug_in(self, st):
+        """"Charging, NN percent, about T to full" (or "Fully charged")."""
+        pct = st["pct"]
+        if pct >= 100 or st["status"] == "Full":
+            self.full_spoken = True
+            self.say(self.ph["plug_in_full"])
+            return
+        eta = ""
+        if st["ttf_min"]:
+            t = fmt_duration(st["ttf_min"])
+            if t:
+                eta = fill(self.ph["plug_in_eta"], t=t)
+        # Not cached: the time estimate makes nearly every one of these unique.
+        # strip(): no stray space left when there's no estimate.
+        self.say(fill(self.ph["plug_in"], p=pct, eta=eta).strip(), cacheable=False)
+
+    def check_charging(self, pct):
+        """While charging: speak each charging alert level once per charge.
+        If several are passed at once, only the highest one's message is spoken."""
+        msg = None
+        for level, m in charge_alerts(self.cfg):
+            if level not in self.done_charge and pct >= level:
+                self.done_charge.add(level)
+                msg = m                 # ascending order: ends on the highest passed
+        if msg:
+            self.say(fill(msg, p=pct))
+
+    def check_discharge(self, pct):
+        """On battery: speak level alerts, the every-1% low zone and reminders."""
+        speak_now = False
+        # Level alerts (40/30/20 by default): once each per discharge. Several
+        # can be passed at once after sleep; then the lowest one's message is used.
+        alert_msg = None
+        for level, m in discharge_alerts(self.cfg):
+            if level not in self.done_thresholds and pct <= level:
+                self.done_thresholds.add(level)
+                alert_msg = m           # descending order: ends on the lowest passed
+        # Low zone: each new lowest whole percent below 15 is spoken.
+        below = int(self.cfg["every_percent_below"])
+        if 0 < pct < below and (self.last_low is None or pct < self.last_low):
+            self.last_low = pct
+            speak_now = True
+        # Calibration reminders still pending, once each per discharge.
+        prompt = False
+        for l in pending_prompt_levels(self.cfg):
+            if l not in self.done_prompts and pct <= l:
+                self.done_prompts.add(l)
+                prompt = True
+        # Exactly one message per tick, in priority order: a calibration
+        # reminder (it already says the level), then the level alert's own
+        # message, then the low/critical countdown wording.
+        if prompt:
+            self.say(fill(self.ph["calibrate"], p=pct))
+        elif alert_msg:
+            self.say(fill(alert_msg, p=pct))
+        elif speak_now:
+            self.say(self.level_phrase(pct))
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_run():
+    """The background service: poll the battery forever, reloading config.json
+    whenever it changes (after a calibration or mute, for example)."""
+    cfg = load_config()
+    # Stop cleanly when systemd (SIGTERM) or Ctrl+C (SIGINT) asks.
+    stop = {"flag": False}
+    signal.signal(signal.SIGTERM, lambda *_: stop.update(flag=True))
+    signal.signal(signal.SIGINT, lambda *_: stop.update(flag=True))
+    a = Announcer(cfg)
+    log(f"started; battery={find_battery()} source={cfg['percent_source']} "
+        f"scale={cfg['percent_scale']} offset={cfg['percent_offset']}")
+    last_mtime = None
+    while not stop["flag"]:
+        try:
+            # Reload settings if the config file's modification time changed.
+            m = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else None
+            if m != last_mtime:
+                if last_mtime is not None:
+                    old_cfg, a.cfg = a.cfg, load_config()
+                    a.ph = a.cfg["phrases"]
+                    a.settings_changed(old_cfg)
+                    log("config reloaded")
+                last_mtime = m
+            st = read_state(a.cfg)
+            if st:
+                a.tick(st)
+        except Exception as e:
+            log(f"error: {e}")          # never let one bad reading kill the service
+        # Sleep in short steps so a stop request is handled promptly.
+        for _ in range(int(max(1, a.cfg["poll_seconds"]) * 4)):
+            if stop["flag"]:
+                break
+            time.sleep(0.25)
+    log("stopped")
+
+
+def cmd_status():
+    """Print every reading and setting, for troubleshooting."""
+    cfg = load_config()
+    st = read_state(cfg)
+    if not st:
+        print("No battery found under", SYSFS)
+        return 1
+    print(f"Battery:        {st['bat']}")
+    print(f"Status:         {st['status']} (plugged in: {'yes' if st['plugged'] else 'no'})")
+    for k, v in st["raws"].items():
+        mark = "  <- used" if k == st["source"] else ""
+        print(f"Raw {k:<12} {v:.1f}%{mark}")
+    print(f"Correction:     x{cfg['percent_scale']:.3f} {cfg['percent_offset']:+.1f}")
+    print(f"Announced as:   {st['pct']}%")
+    ttf = st["ttf_min"]
+    if st["plugged"]:
+        print(f"Time to full:   {fmt_duration(ttf) if ttf else 'unknown'}")
+    else:
+        tte = st["tte_min"]
+        print(f"Time remaining: {fmt_duration(tte) if tte else 'unknown'}")
+    print(f"Automatic:      {'on' if cfg.get('enabled', True) else 'OFF (muted)'}")
+    pend = pending_prompt_levels(cfg)
+    print(f"Cal. reminders: {', '.join(f'{l}%' for l in pend) if pend else 'none pending'}")
+    print(f"Readout:        {readout_text(cfg, st)}")
+    print(f"Piper:          {find_piper(cfg) or 'NOT FOUND'}")
+    print(f"Voice:          {find_model(cfg) or 'NOT FOUND'}")
+    print(f"Player:         {find_player()[1] or 'NOT FOUND'}")
+    print(f"Window Python:  {GUI_PYTHON if os.access(GUI_PYTHON, os.X_OK) else 'SteamOS system Python'}")
+    return 0
+
+
+def apply_calibration(steam):
+    """Compare Steam's % with what we announce; save a correction only if they differ.
+
+    Steps:
+      1. Mark the nearest reminder level as done (even if nothing differs).
+      2. If Steam and the announcer already agree, stop there.
+      3. Otherwise store this reading as a calibration point, then pick the raw
+         source and the scale/offset line that best match all saved points.
+
+    Returns a dict describing what happened (used by the CLI and the window).
+    """
+    steam = float(steam)
+    if not 0 <= steam <= 100:
+        raise ValueError("Steam's percentage must be between 0 and 100")
+    cfg = load_config()
+    bat = find_battery()
+    raws = raw_percents(bat) if bat else {}
+    st = read_state(cfg)
+    if not raws or not st:
+        raise RuntimeError("No battery reading found")
+    res = {"steam": steam, "raws": raws, "before": st["pct"], "after": st["pct"],
+           "changed": False, "source": cfg["percent_source"],
+           "scale": float(cfg["percent_scale"]), "offset": float(cfg["percent_offset"]),
+           "points": len(cfg.get("calibration_points", []))}
+
+    # 1. Reminders: this calibration covers the nearest level.
+    levels = [int(l) for l in cfg.get("calibration_prompt_levels", [])]
+    done_before = calibration_levels_done(cfg)
+    level = nearest_level(levels, steam)
+    res["cleared"] = level if level is not None and level not in done_before else None
+    done_now = sorted(set(done_before) | ({level} if level is not None else set()), reverse=True)
+    # Save when something was cleared, or the first time, to store the list
+    # (older configs only had calibration points to derive it from).
+    if "calibration_levels_done" not in cfg or res["cleared"] is not None:
+        save_config_values({"calibration_levels_done": done_now})
+        cfg = load_config()
+    res["pending"] = pending_prompt_levels(cfg)
+
+    # 2. Already matching: confirmation only, no correction needed.
+    if int(round(steam)) == st["pct"]:
+        return res
+
+    # 3. New calibration point, recording every raw source so the fit can compare them.
+    new_pt = {"steam": steam, **{k: round(v, 2) for k, v in raws.items()}}
+    # Replace older points taken at nearly the same level, keep the rest.
+    points = [p for p in cfg.get("calibration_points", []) if isinstance(p, dict)
+              and not any(k in p and abs(p[k] - v) < 3 for k, v in raws.items())]
+    points.append(new_pt)
+    points = points[-6:]                # keep the six most recent
+    # Try each raw source and keep the one whose fitted line has the lowest
+    # average error (a tiny penalty on large offsets breaks near-ties).
+    best, best_err, best_fit = None, None, None
+    for src in raws:
+        pts = [(p[src], p["steam"]) for p in points if src in p]
+        fit = fit_line(pts)
+        err = sum(abs(x * fit[0] + fit[1] - y) for x, y in pts) / len(pts) + abs(fit[1]) * 0.01
+        if best_err is None or err < best_err:
+            best, best_err, best_fit = src, err, fit
+    scale, offset = best_fit
+    save_config_values({"percent_source": best, "percent_scale": round(scale, 4),
+                        "percent_offset": round(offset, 2), "calibration_points": points})
+    after = read_state(load_config())
+    res.update(changed=True, source=best, scale=scale, offset=offset,
+               points=len(points), after=after["pct"] if after else int(round(steam)))
+    return res
+
+
+def cmd_calibrate(arg):
+    """`calibrate 87`: the command-line version of the calibration window."""
+    try:
+        res = apply_calibration(arg.rstrip("%"))
+    except ValueError:
+        print("Usage: battery-announce calibrate 87   (the % Steam shows right now, 0-100)")
+        return 1
+    except RuntimeError as e:
+        print(e)
+        return 1
+    print("Readings now: " + ", ".join(f"{k} {v:.1f}%" for k, v in res["raws"].items())
+          + f"; announced {res['before']}%; Steam {res['steam']:g}%")
+    if res.get("cleared") is not None:
+        print(f"Calibration reminder for {res['cleared']}% cleared.")
+    print("Reminders still pending: " + (", ".join(f"{l}%" for l in res["pending"]) or "none"))
+    if not res["changed"]:
+        print("Already matches Steam; correction unchanged.")
+        return 0
+    print(f"Saved: source={res['source']}, scale={res['scale']:.3f}, offset={res['offset']:+.2f} "
+          f"({res['points']} calibration point{'s' if res['points'] != 1 else ''}). "
+          f"Now announces {res['after']}%.")
+    if res["points"] < 2:
+        print("Tip: calibrate again later at a level at least 20 points away for a better fit.")
+    print("The running service picks this up within a few seconds.")
+    return 0
+
+
+def fit_line(pts):
+    """Fit Steam % = raw % * scale + offset through (raw, steam) points.
+
+    Offset only for one point (or close points); least squares otherwise.
+    Returns (scale, offset).
+    """
+    xs = [x for x, _ in pts]
+    if len(pts) < 2 or max(xs) - min(xs) < 15:
+        # Points too close together to judge a slope: just shift by the average gap.
+        off = sum(y - x for x, y in pts) / len(pts)
+        return 1.0, off
+    # Ordinary least-squares straight line.
+    n = len(pts)
+    mx, my = sum(xs) / n, sum(y for _, y in pts) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in pts)
+    scale = sxy / sxx
+    if not 0.8 <= scale <= 1.25:          # implausible, fall back to offset only
+        return 1.0, my - mx
+    return scale, my - scale * mx
+
+
+def cmd_reset_calibration():
+    """Forget all calibration; reminders return and the raw value is announced."""
+    save_config_values({"percent_source": "capacity", "percent_scale": 1.0,
+                        "percent_offset": 0.0, "calibration_points": [],
+                        "calibration_levels_done": []})
+    print("Calibration removed; announcing the raw kernel value. Calibration reminders are back on.")
+    return 0
+
+
+def cmd_test():
+    """Speak one example of each announcement, to check the voice and volume."""
+    cfg = load_config()
+    ph = cfg["phrases"]
+    first = discharge_alerts(cfg)[:1]
+    level_text = fill(first[0][1], p=first[0][0]) if first else fill(ph["level"], p=40)
+    for text in (level_text, fill(ph["low"], p=14), fill(ph["critical"], p=3),
+                 fill(ph["plug_in"], p=62, eta=fill(ph["plug_in_eta"], t="45 minutes")),
+                 fill(ph["unplug"], p=98), ph["full"]):
+        speak(text, cfg, cacheable=False)
+        time.sleep(0.4)
+    return 0
+
+
+def readout_text(cfg, st):
+    """Text for the manual readout, e.g. "Discharging. 54 percent. Estimated
+    2 hours remaining." Uses the kernel's time estimate, or failing that the
+    rate the running service measured (see saved_rate)."""
+    ph, pct = cfg["phrases"], st["pct"]
+    rate, rate_plugged = saved_rate()
+    if st["plugged"]:
+        if pct >= 100 or st["status"] == "Full":
+            return ph["readout_full"]
+        mins = st["ttf_min"]
+        if mins is None and rate and rate > 0.05 and rate_plugged:
+            mins = (100 - pct) / rate
+        if st["status"] == "Not charging" and not mins:
+            return fill(ph["readout_plugged_idle"], p=pct)
+        t = fmt_duration(mins) if mins else None
+        return fill(ph["readout_charging"], p=pct, eta=fill(ph["readout_eta_full"], t=t) if t else "")
+    mins = st["tte_min"]
+    if mins is None and rate and rate < -0.02 and rate_plugged is False:
+        mins = pct / -rate
+    t = fmt_duration(mins) if mins else None
+    return fill(ph["readout_discharging"], p=pct, eta=fill(ph["readout_eta_empty"], t=t) if t else "")
+
+
+def cmd_now():
+    """`now`: speak the readout once (the Battery Readout launcher)."""
+    cfg = load_config()
+    st = read_state(cfg)
+    if not st:
+        print("No battery found.")
+        return 1
+    speak(readout_text(cfg, st), cfg, cacheable=False)   # works even when muted
+    return 0
+
+
+def cmd_set_enabled(value):
+    """`on` / `off` / `toggle` (value None): mute or unmute the automatic
+    announcements and say the new state. The running service reloads the
+    config file within a few seconds."""
+    cfg = load_config()
+    if value is None:
+        value = not cfg.get("enabled", True)
+    save_config_values({"enabled": value})
+    cfg["enabled"] = value
+    speak(cfg["phrases"]["unmuted" if value else "muted"], cfg)
+    print("Automatic announcements", "ON" if value else "OFF")
+    return 0
+
+
+# ---------------------------------------------------------------- calibration window
+# Launched from Steam as "Battery Calibrate". Tries, in order: a tkinter window
+# (large buttons, readable in VR), a zenity slider, a kdialog input box, and
+# finally a terminal prompt, because not every SteamOS build includes tkinter.
+
+def _speak_async(text):
+    """Speak without blocking the window (uses this same script's `say`)."""
+    if os.environ.get("BATTERY_ANNOUNCE_DRYRUN"):
+        log("say: " + text)
+        return
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "say", text],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        pass
+
+
+def _reminder_text(res):
+    """Sentence about reminders after a save, e.g. "The 60% reminder is cleared.
+    Reminders left: 80%, 40%, 20%." """
+    cleared = (f"The {res['cleared']}% reminder is cleared. "
+               if res.get("cleared") is not None else "")
+    pend = res.get("pending") or []
+    left = ("Reminders left: " + ", ".join(f"{l}%" for l in pend) + "."
+            if pend else "All calibration reminders are done.")
+    return cleared + left
+
+
+def _result_lines(res):
+    """(title, body) shown after saving, for every dialog style."""
+    if not res["changed"]:
+        return ("Already matches Steam",
+                f"Steam and the announcer both read {res['before']}%. No correction needed. "
+                + _reminder_text(res))
+    return ("Calibration saved",
+            f"Announcer changed from {res['before']}% to {res['after']}% "
+            f"(sensor x{res['scale']:.3f} {res['offset']:+.1f}). " + _reminder_text(res))
+
+
+def _snapshot():
+    """What the window displays: raw and announced %, plug state, reminders."""
+    cfg = load_config()
+    st = read_state(cfg)
+    if not st:
+        return None
+    return {"raw": st["raw"], "pct": st["pct"], "status": st["status"],
+            "plugged": st["plugged"], "source": st["source"],
+            "calibrated": bool(cfg.get("calibration_points")),
+            "pending": pending_prompt_levels(cfg)}
+
+
+def use_gui_python():
+    """Restart this command under the private window Python if install.sh
+    created one (it only does so when SteamOS's Python can't draw windows).
+    Does nothing if it's missing or already running."""
+    if not os.path.isfile(GUI_PYTHON) or not os.access(GUI_PYTHON, os.X_OK):
+        return
+    if os.path.realpath(sys.executable) == os.path.realpath(GUI_PYTHON):
+        return
+    try:
+        os.execv(GUI_PYTHON, [GUI_PYTHON, os.path.abspath(__file__)] + sys.argv[1:])
+    except OSError as e:
+        log(f"couldn't start the window Python ({e}); using this one")
+
+
+def cmd_calibrate_gui():
+    """Open the calibration window, falling back to simpler dialogs."""
+    use_gui_python()
+    snap = _snapshot()
+    if not snap:
+        msg = "No battery reading found."
+        print(msg)
+        for tool in (["zenity", "--error", "--text", msg], ["kdialog", "--error", msg]):
+            if shutil.which(tool[0]):
+                subprocess.run(tool)
+                break
+        return 1
+    try:
+        import tkinter  # noqa: F401  (only checking that it exists)
+        return _calibrate_tk(snap)
+    except ImportError:
+        pass
+    except Exception as e:          # no display etc.
+        log(f"tkinter window failed ({e}); trying another dialog")
+    if shutil.which("zenity"):
+        return _calibrate_zenity(snap)
+    if shutil.which("kdialog"):
+        return _calibrate_kdialog(snap)
+    return _calibrate_terminal(snap)
+
+
+def _describe(snap):
+    """One-line summary used by the simple dialogs."""
+    state = "Charging" if snap["plugged"] else "On battery"
+    return (f"Battery sensor reads {snap['raw']:.0f}%. "
+            f"The announcer says {snap['pct']}% ({state}).")
+
+
+def _finish(res):
+    """Common end of every dialog: print the result and say it out loud."""
+    title, body = _result_lines(res)
+    print(title + ". " + body)
+    _speak_async("Calibration saved. " + f"{res['after']} percent." if res["changed"]
+                 else f"Already matches Steam. {res['before']} percent.")
+    return title, body
+
+
+def _calibrate_zenity(snap):
+    """Fallback 1: zenity slider preset to the announcer's value."""
+    r = subprocess.run(["zenity", "--scale", "--title", "Battery Calibration",
+                        "--text", _describe(snap) + "\n\nSet the slider to the percentage Steam shows:",
+                        "--min-value", "0", "--max-value", "100",
+                        "--value", str(snap["pct"]), "--step", "1", "--width", "560"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return 0                        # cancelled
+    try:
+        title, body = _finish(apply_calibration(r.stdout.strip()))
+    except Exception as e:
+        subprocess.run(["zenity", "--error", "--text", str(e)])
+        return 1
+    subprocess.run(["zenity", "--info", "--title", title, "--text", body, "--width", "480"])
+    return 0
+
+
+def _calibrate_kdialog(snap):
+    """Fallback 2: KDE input box preset to the announcer's value."""
+    r = subprocess.run(["kdialog", "--title", "Battery Calibration", "--inputbox",
+                        _describe(snap) + "\n\nWhat percentage does Steam show?", str(snap["pct"])],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return 0                        # cancelled
+    try:
+        title, body = _finish(apply_calibration(r.stdout.strip().rstrip("%")))
+    except Exception as e:
+        subprocess.run(["kdialog", "--error", f"Not saved: {e}"])
+        return 1
+    subprocess.run(["kdialog", "--title", title, "--msgbox", body])
+    return 0
+
+
+def _calibrate_terminal(snap):
+    """Last resort: ask in the terminal."""
+    print(_describe(snap))
+    try:
+        v = input(f"What percentage does Steam show? [{snap['pct']}] ").strip() or str(snap["pct"])
+        _finish(apply_calibration(v.rstrip("%")))
+    except (EOFError, KeyboardInterrupt):
+        return 0
+    except Exception as e:
+        print("Not saved:", e)
+        return 1
+    return 0
+
+
+def _calibrate_tk(snap):
+    """The main calibration window.
+
+    Layout: two cards (raw sensor % and announced %), the reminders still
+    pending, the question "What does Steam show right now?" with -10/-1/+1/+10
+    buttons around a big number, then Save / Cancel / Reset. After saving it
+    switches to a result screen that closes itself after 10 seconds.
+    """
+    import tkinter as tk
+
+    # Dark theme colours: background, card, text, dim text, accent, success.
+    BG, CARD, FG, DIM, ACC, OK = "#15171c", "#22262e", "#eef1f6", "#9aa3b2", "#3d8bfd", "#2fb36d"
+    root = tk.Tk()
+    root.title("Battery Calibration")
+    root.configure(bg=BG)
+    # Size everything from the screen height so it stays readable on any display.
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    u = max(14, min(sh // 34, 40))            # base font size, scales with screen
+    w, h = min(sw, u * 46), min(sh, u * 30)
+    root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")   # centred
+    F = lambda m, bold=False: ("DejaVu Sans", int(u * m), "bold" if bold else "normal")
+
+    # Mutable window state:
+    #   value    the number the user is setting (starts at the announced %)
+    #   touched  True once the user has adjusted it (stops live updates overwriting it)
+    #   snap     latest battery snapshot
+    #   closing  None while editing; seconds left once the result is shown
+    state = {"value": snap["pct"], "touched": False, "snap": snap, "closing": None}
+
+    # Two screens: `main` for editing, `result` after saving.
+    main = tk.Frame(root, bg=BG)
+    result = tk.Frame(root, bg=BG)
+    main.pack(fill="both", expand=True, padx=u, pady=u * 0.6)
+
+    tk.Label(main, text="Battery Calibration", font=F(1.5, True), bg=BG, fg=FG).pack(pady=(0, u * 0.5))
+
+    # --- the two reading cards
+    cards = tk.Frame(main, bg=BG)
+    cards.pack(fill="x")
+    def card(col, caption):
+        """A card with a caption, a big number and a small note; returns the
+        number and note labels so they can be updated later."""
+        f = tk.Frame(cards, bg=CARD, padx=u, pady=u * 0.4)
+        f.grid(row=0, column=col, sticky="nsew", padx=u * 0.3)
+        cards.columnconfigure(col, weight=1)
+        tk.Label(f, text=caption, font=F(0.8), bg=CARD, fg=DIM).pack()
+        num = tk.Label(f, font=F(2.2, True), bg=CARD, fg=FG)
+        num.pack()
+        sub = tk.Label(f, font=F(0.7), bg=CARD, fg=DIM)
+        sub.pack()
+        return num, sub
+    raw_lbl, raw_sub = card(0, "Battery sensor")
+    ann_lbl, ann_sub = card(1, "Announcer says")
+
+    # --- reminders still pending
+    remind = tk.Label(main, font=F(0.7), bg=BG, fg=DIM)
+    remind.pack(pady=(u * 0.3, 0))
+
+    # --- the value to enter
+    tk.Label(main, text="What does Steam show right now?", font=F(1.05, True),
+             bg=BG, fg=FG).pack(pady=(u * 0.5, u * 0.3))
+
+    row = tk.Frame(main, bg=BG)
+    row.pack()
+    val_lbl = tk.Label(row, font=F(2.6, True), bg=BG, fg=ACC, width=4)
+
+    def btn(parent, text, cmd, color=CARD, fg=FG, size=1.1, width=4):
+        """A large flat button that highlights when it has keyboard focus."""
+        b = tk.Button(parent, text=text, command=cmd, font=F(size, True), bg=color, fg=fg,
+                      activebackground=ACC, activeforeground="white", relief="flat",
+                      bd=0, highlightthickness=2, highlightbackground=BG,
+                      highlightcolor=ACC, width=width, cursor="hand2", takefocus=1)
+        return b
+
+    def show_value():
+        """Redraw the big number and the hint saying what Save will do."""
+        val_lbl.config(text=f"{state['value']}%")
+        diff = state["value"] - state["snap"]["pct"]
+        hint.config(text="Matches the announcer: saving confirms it, no correction" if diff == 0
+                    else f"{abs(diff)} point{'s' if abs(diff) != 1 else ''} "
+                         f"{'higher' if diff > 0 else 'lower'} than the announcer: will be corrected",
+                    fg=DIM if diff == 0 else OK)
+
+    def nudge(d):
+        """Change the value by d, kept within 0-100."""
+        state["value"] = max(0, min(100, state["value"] + d))
+        state["touched"] = True
+        show_value()
+
+    # -10 / -1  [value]  +1 / +10
+    for i, d in enumerate((-10, -1)):
+        btn(row, f"{d:+d}".replace("-", "−"), lambda d=d: nudge(d)).grid(row=0, column=i, padx=u * 0.25)
+    val_lbl.grid(row=0, column=2, padx=u * 0.5)
+    for i, d in enumerate((1, 10)):
+        btn(row, f"+{d}", lambda d=d: nudge(d)).grid(row=0, column=3 + i, padx=u * 0.25)
+
+    hint = tk.Label(main, font=F(0.75), bg=BG, fg=DIM)
+    hint.pack(pady=(u * 0.3, 0))
+
+    # --- Save / Cancel / Reset (save and reset are defined further down)
+    actions = tk.Frame(main, bg=BG)
+    actions.pack(pady=(u * 0.8, 0))
+    save_b = btn(actions, "Save", lambda: save(), color=ACC, fg="white", width=8)
+    save_b.grid(row=0, column=0, padx=u * 0.4)
+    btn(actions, "Cancel", root.destroy, width=8).grid(row=0, column=1, padx=u * 0.4)
+    btn(actions, "Reset", lambda: reset(), size=0.8, width=7, fg=DIM).grid(row=0, column=2, padx=u * 0.4)
+
+    tk.Label(main, text="Buttons or arrows adjust · Enter saves · Esc closes",
+             font=F(0.65), bg=BG, fg=DIM).pack(side="bottom")
+
+    # --- result screen (hidden until Save)
+    res_title = tk.Label(result, font=F(1.6, True), bg=BG, fg=OK)
+    res_title.pack(pady=(u * 3, u * 0.6))
+    res_body = tk.Label(result, font=F(0.95), bg=BG, fg=FG, wraplength=w - u * 4, justify="center")
+    res_body.pack(padx=u * 2)
+    done_b = btn(result, "Done", root.destroy, color=ACC, fg="white", width=8)
+    done_b.pack(pady=u * 1.2)
+    countdown = tk.Label(result, font=F(0.65), bg=BG, fg=DIM)
+    countdown.pack()
+
+    def refresh_cards():
+        """Update the cards and reminder line from the latest snapshot."""
+        sn = state["snap"]
+        raw_lbl.config(text=f"{sn['raw']:.0f}%")
+        raw_sub.config(text="Charging" if sn["plugged"] else "On battery")
+        ann_lbl.config(text=f"{sn['pct']}%")
+        ann_sub.config(text="calibrated" if sn["calibrated"] else "not calibrated yet")
+        pend = sn.get("pending") or []
+        remind.config(text=("Calibration reminders left: " + " · ".join(f"{l}%" for l in pend))
+                      if pend else "All calibration reminders done")
+
+    def poll():
+        """Re-read the battery every 2 seconds while editing. The entered value
+        follows the announcer until the user adjusts it."""
+        if state["closing"] is not None:
+            return
+        sn = _snapshot()
+        if sn:
+            state["snap"] = sn
+            if not state["touched"]:
+                state["value"] = sn["pct"]
+            refresh_cards()
+            show_value()
+        root.after(2000, poll)
+
+    def show_result(title, body, color=OK):
+        """Switch to the result screen and start the 10-second auto-close."""
+        main.pack_forget()
+        result.pack(fill="both", expand=True)
+        res_title.config(text=title, fg=color)
+        res_body.config(text=body)
+        done_b.focus_set()
+        state["closing"] = 10
+        tick()
+
+    def tick():
+        """Countdown on the result screen; closes the window at zero."""
+        if state["closing"] <= 0:
+            root.destroy()
+            return
+        countdown.config(text=f"Closing in {state['closing']} s")
+        state["closing"] -= 1
+        root.after(1000, tick)
+
+    def save():
+        """Apply the entered value (see apply_calibration) and show the outcome."""
+        try:
+            res = apply_calibration(state["value"])
+        except Exception as e:
+            show_result("Not saved", str(e), color="#e5534b")
+            return
+        title, body = _finish(res)
+        show_result(title, body, color=OK if res["changed"] else ACC)
+
+    def reset():
+        """Clear all calibration and refresh the display."""
+        cmd_reset_calibration()
+        state["touched"] = False
+        poll_once = _snapshot()
+        if poll_once:
+            state["snap"] = poll_once
+            state["value"] = poll_once["pct"]
+        refresh_cards()
+        show_value()
+        hint.config(text="Calibration cleared: announcer now uses the raw sensor value", fg=DIM)
+
+    # Keyboard: arrows/plus/minus adjust, Enter saves (or closes the result
+    # screen), Esc closes. Adjusting is ignored once the result is showing.
+    for key, d in (("<Left>", -1), ("<Right>", 1), ("<Down>", -10), ("<Up>", 10),
+                   ("<minus>", -1), ("<plus>", 1), ("<KP_Subtract>", -1), ("<KP_Add>", 1)):
+        root.bind(key, lambda e, d=d: nudge(d) if state["closing"] is None else None)
+    root.bind("<Return>", lambda e: save() if state["closing"] is None else root.destroy())
+    root.bind("<KP_Enter>", lambda e: save() if state["closing"] is None else root.destroy())
+    root.bind("<Escape>", lambda e: root.destroy())
+
+    refresh_cards()
+    show_value()
+    save_b.focus_set()
+    root.after(2000, poll)
+    if os.environ.get("BATTERY_ANNOUNCE_SCREENSHOT"):   # for testing: auto-close after N ms
+        root.after(int(os.environ.get("BATTERY_ANNOUNCE_SCREENSHOT")), root.destroy)
+    root.mainloop()
+    return 0
+
+
+# ---------------------------------------------------------------- alert settings
+# Shared by the Battery Alerts window and the `alerts` command: read every
+# editable alert setting into one plain dict, validate an edited copy, and
+# save it back to config.json.
+
+# Messages editable on the "Low battery" and "Charger" pages.
+ALERT_PHRASES = ("low", "critical", "plug_in", "plug_in_eta", "plug_in_full", "unplug", "full")
+# Charger on/off switches: settings-window name -> config key.
+CHARGER_SWITCHES = {"plug_in": "announce_plug_in", "unplug": "announce_unplug", "full": "announce_full"}
+
+
+def alert_settings(cfg):
+    """All editable alert settings from a config, with every message filled in
+    (blank per-level messages show the shared default wording)."""
+    return {
+        "battery": [{"level": l, "message": m} for l, m in discharge_alerts(cfg)],
+        "charging": [{"level": l, "message": m} for l, m in charge_alerts(cfg)],
+        "low_below": int(cfg["every_percent_below"]),
+        "critical_at": int(cfg["phrases"]["critical_at_or_below"]),
+        "phrases": {k: cfg["phrases"][k] for k in ALERT_PHRASES},
+        "switches": {k: bool(cfg[v]) for k, v in CHARGER_SWITCHES.items()},
+    }
+
+
+def default_alert_settings():
+    """The factory settings, used by "Defaults" / `alerts reset`."""
+    return alert_settings(deep_merge(DEFAULTS, {}))
+
+
+def validate_alert_settings(model):
+    """Return a list of problems (empty if the settings can be saved)."""
+    errors = []
+    for name, label in (("battery", "On battery"), ("charging", "While charging")):
+        levels = []
+        for a in model[name]:
+            try:
+                lvl = int(a["level"])
+            except (TypeError, ValueError):
+                errors.append(f"{label}: '{a['level']}' is not a number")
+                continue
+            if not 1 <= lvl <= 99:
+                errors.append(f"{label}: {lvl}% must be between 1 and 99")
+            levels.append(lvl)
+            if len(a["message"]) > 200:
+                errors.append(f"{label} {lvl}%: message is too long (200 characters max)")
+        dups = sorted({l for l in levels if levels.count(l) > 1})
+        if dups:
+            errors.append(f"{label}: {', '.join(f'{d}%' for d in dups)} listed more than once")
+    for key, label in (("low_below", "Countdown start"), ("critical_at", "Critical level")):
+        if not 0 <= int(model[key]) <= 99:
+            errors.append(f"{label} must be between 0 and 99")
+    for k, v in model["phrases"].items():
+        if len(v) > 200:
+            errors.append(f"Message '{k}' is too long (200 characters max)")
+    return errors
+
+
+def save_alert_settings(model):
+    """Validate and write the settings. Messages left blank, or identical to
+    the default wording, are stored as "use the default" so they keep
+    following it. Returns the list of problems (empty = saved)."""
+    errors = validate_alert_settings(model)
+    if errors:
+        return errors
+    cfg = load_config()
+
+    def alerts_out(items, shared, reverse):
+        """Sorted alerts for config.json; a message equal to the shared default
+        is stored blank so it keeps following that default."""
+        out = []
+        for a in sorted(items, key=lambda a: int(a["level"]), reverse=reverse):
+            msg = a["message"].strip()
+            out.append({"level": int(a["level"]), "message": "" if msg == shared else msg})
+        return out
+
+    # Phrase overrides: keep the user's other custom phrases, store ours only
+    # where they differ from the defaults.
+    try:
+        with open(CONFIG_PATH) as f:
+            phrases = dict(json.load(f).get("phrases") or {})
+    except Exception:
+        phrases = {}
+    wanted = {k: (model["phrases"][k].strip() or DEFAULTS["phrases"][k]) for k in ALERT_PHRASES}
+    wanted["critical_at_or_below"] = int(model["critical_at"])
+    for k, v in wanted.items():
+        if v == DEFAULTS["phrases"][k]:
+            phrases.pop(k, None)
+        else:
+            phrases[k] = v
+
+    values = {
+        "discharge_alerts": alerts_out(model["battery"], cfg["phrases"]["level"], True),
+        "charge_alerts": alerts_out(model["charging"], cfg["phrases"]["charge_level"], False),
+        "discharge_thresholds": None,   # old name, superseded by discharge_alerts
+        "every_percent_below": int(model["low_below"]),
+        "phrases": phrases or None,
+    }
+    for k, key in CHARGER_SWITCHES.items():
+        values[key] = bool(model["switches"][k])
+    save_config_values(values)
+    return []
+
+
+def _sample_text(msg, level):
+    """A message as it would be spoken, for the test buttons."""
+    return fill(msg, p=level, t="45 minutes",
+                eta=fill(load_config()["phrases"]["plug_in_eta"], t="45 minutes")).strip()
+
+
+def cmd_alerts(args):
+    """`alerts ...`: view and change alerts from Konsole (same settings as the
+    Battery Alerts window). Run `battery-announce alerts help` for usage."""
+    usage = """Usage:
+  battery-announce alerts                              show all alert settings
+  battery-announce alerts add battery|charging LEVEL ["MESSAGE"]
+  battery-announce alerts remove battery|charging LEVEL
+  battery-announce alerts message battery|charging LEVEL "MESSAGE"   ("" = default)
+  battery-announce alerts message low|critical|plug_in|plug_in_eta|plug_in_full|unplug|full "MESSAGE"
+  battery-announce alerts countdown N        every-1% countdown below N% (0 = off)
+  battery-announce alerts critical N         "critical" wording at or below N%
+  battery-announce alerts on|off plug_in|unplug|full
+  battery-announce alerts reset              restore the default alerts
+Placeholders: {p} = percent, {eta} = the time-to-full sentence, {t} = a time."""
+    m = alert_settings(load_config())
+    try:
+        verb = args[0] if args else "show"
+        if verb in ("show", "list"):
+            pass
+        elif verb == "reset":
+            m = default_alert_settings()
+        elif verb in ("add", "remove") or (verb == "message" and args[1] in ("battery", "charging")):
+            which, level = args[1], int(args[2])
+            if which not in ("battery", "charging"):
+                raise IndexError
+            items = [a for a in m[which] if a["level"] != level]
+            if verb == "add":
+                shared = load_config()["phrases"]["level" if which == "battery" else "charge_level"]
+                items.append({"level": level, "message": args[3] if len(args) > 3 else shared})
+            elif verb == "remove":
+                if len(items) == len(m[which]):
+                    print(f"No {which} alert at {level}%.")
+                    return 1
+            else:   # message for one level
+                if len(items) == len(m[which]):
+                    print(f"No {which} alert at {level}%; add it first.")
+                    return 1
+                items.append({"level": level, "message": args[3]})
+            m[which] = items
+        elif verb == "message":
+            key = args[1].replace("-", "_")
+            if key not in ALERT_PHRASES:
+                raise IndexError
+            m["phrases"][key] = args[2]
+        elif verb == "countdown":
+            m["low_below"] = int(args[1])
+        elif verb == "critical":
+            m["critical_at"] = int(args[1])
+        elif verb in ("on", "off"):
+            key = args[1].replace("-", "_")
+            if key not in CHARGER_SWITCHES:
+                raise IndexError
+            m["switches"][key] = verb == "on"
+        else:
+            print(usage)
+            return 1
+    except (IndexError, ValueError):
+        print(usage)
+        return 1
+    if verb not in ("show", "list"):
+        errors = save_alert_settings(m)
+        if errors:
+            print("Not saved:\n  " + "\n  ".join(errors))
+            return 1
+        print("Saved. The running announcer picks this up within a few seconds.\n")
+        m = alert_settings(load_config())
+    # Show the result.
+    print("On battery:")
+    for a in m["battery"] or [{"level": "-", "message": "(none)"}]:
+        print(f"  {a['level']:>3}%  {a['message']}")
+    print(f"  Countdown every 1% below {m['low_below']}%: {m['phrases']['low']}"
+          if m["low_below"] else "  Countdown: off")
+    print(f"  Critical at or below {m['critical_at']}%: {m['phrases']['critical']}")
+    print("While charging:")
+    for a in m["charging"] or [{"level": "-", "message": "(none)"}]:
+        print(f"  {a['level']:>3}%  {a['message']}")
+    print("Charger:")
+    for k, label in (("plug_in", "Plugged in"), ("unplug", "Unplugged"), ("full", "Fully charged")):
+        state = "on " if m["switches"][k] else "off"
+        print(f"  [{state}] {label}: {m['phrases'][k]}")
+    print(f"        time-to-full part: {m['phrases']['plug_in_eta']}")
+    print(f"        if already full:   {m['phrases']['plug_in_full']}")
+    return 0
+
+
+# ---------------------------------------------------------------- alerts window
+# Launched from Steam as "Battery Alerts". Four pages chosen with the tabs at
+# the top: On battery, Low battery, Charging, Charger Plugin Status. Nothing is written until
+# Save is pressed. Typing a message needs a keyboard: in Game Mode, open
+# Steam's on-screen keyboard.
+
+def cmd_alerts_gui():
+    """Open the alert settings window (or explain the Konsole commands if no
+    Python with tkinter is available)."""
+    use_gui_python()
+    try:
+        import tkinter  # noqa: F401  (only checking that it exists)
+        return _alerts_tk()
+    except ImportError:
+        pass
+    except Exception as e:          # no display etc.
+        log(f"tkinter window failed ({e})")
+    msg = ("The alert settings window needs Python's window toolkit (tkinter), "
+           "which isn't available.\n\nIn Desktop Mode, run install.sh again from "
+           "Konsole: it installs a private copy. Meanwhile, alerts can be changed with:\n"
+           "  python3 ~/.local/bin/battery-announce alerts help")
+    for tool in (["zenity", "--info", "--width", "520", "--text", msg], ["kdialog", "--msgbox", msg]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool)
+            return 1
+    print(msg)
+    return 1
+
+
+def _alerts_tk():
+    """The Battery Alerts window."""
+    import tkinter as tk
+
+    # Same look as the calibration window.
+    BG, CARD, FG, DIM, ACC, OK, BAD = ("#15171c", "#22262e", "#eef1f6", "#9aa3b2",
+                                       "#3d8bfd", "#2fb36d", "#e5534b")
+    root = tk.Tk()
+    root.title("Battery Alerts")
+    root.configure(bg=BG)
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    u = max(13, min(sh // 38, 36))            # base font size, scales with screen
+    w, h = min(sw, u * 52), min(sh, u * 34)
+    root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+    F = lambda m, bold=False: ("DejaVu Sans", int(u * m), "bold" if bold else "normal")
+
+    # Dark styling for the level dropdowns (ttk.Combobox) and their pop-up lists.
+    from tkinter import ttk
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure("Level.TCombobox", fieldbackground=CARD, background=CARD, foreground=ACC,
+                    arrowcolor=FG, bordercolor=CARD, lightcolor=CARD, darkcolor=CARD,
+                    selectbackground=CARD, selectforeground=ACC, arrowsize=int(u * 0.9),
+                    padding=int(u * 0.15))
+    style.map("Level.TCombobox", fieldbackground=[("readonly", CARD)],
+              foreground=[("readonly", ACC)], background=[("active", ACC)])
+    root.option_add("*TCombobox*Listbox.font", F(0.85, True))
+    root.option_add("*TCombobox*Listbox.background", CARD)
+    root.option_add("*TCombobox*Listbox.foreground", FG)
+    root.option_add("*TCombobox*Listbox.selectBackground", ACC)
+    root.option_add("*TCombobox*Listbox.selectForeground", "white")
+
+    # The settings being edited. Lists hold tk variables so the widgets and
+    # the data stay in step; `collect()` turns them back into a plain dict.
+    model = alert_settings(load_config())
+    defaults = default_alert_settings()
+    state = {"page": None, "dirty": False}
+
+    def mark_dirty(*_):
+        """Note that something was edited (called by every field's trace)."""
+        state["dirty"] = True
+        status.config(text="Unsaved changes", fg=DIM)
+
+    def btn(parent, text, cmd, color=CARD, fg=FG, size=0.9, width=3):
+        """A flat button that highlights when it has keyboard focus."""
+        return tk.Button(parent, text=text, command=cmd, font=F(size, True), bg=color, fg=fg,
+                         activebackground=ACC, activeforeground="white", relief="flat",
+                         bd=0, highlightthickness=2, highlightbackground=BG,
+                         highlightcolor=ACC, width=width, cursor="hand2", takefocus=1,
+                         padx=u * 0.2)
+
+    def entry(parent, var):
+        """A message text box; any edit marks the window as changed."""
+        var.trace_add("write", mark_dirty)
+        return tk.Entry(parent, textvariable=var, font=F(0.85), bg=CARD, fg=FG,
+                        insertbackground=FG, relief="flat", highlightthickness=2,
+                        highlightbackground=CARD, highlightcolor=ACC)
+
+    def play(get_text, get_level):
+        """Speak a message as it would sound (the ▶ buttons)."""
+        _speak_async(_sample_text(get_text(), get_level()))
+
+    def level_picker(parent, value, on_pick, allow_off=False):
+        """A dropdown of levels 1%-99% (plus "Off" = 0 if allowed).
+
+        Clicking anywhere on the box opens the list (an easy target with a VR
+        pointer); it scrolls and shows 8 levels at a time (short enough to fit
+        on screen above or below the box). `on_pick(level)` is
+        called with the new level and returns False to refuse it (the old
+        value is restored).
+        """
+        choices = (["Off"] if allow_off else []) + [f"{n}%" for n in range(1, 100)]
+        label = lambda n: "Off" if n == 0 else f"{n}%"
+        var = tk.StringVar(value=label(value))
+        box = ttk.Combobox(parent, textvariable=var, values=choices, width=4, height=8,
+                           font=F(1.05, True), style="Level.TCombobox", justify="center",
+                           state="readonly")
+        box.current_level = value
+
+        def commit(_=None):
+            """Check the chosen level and pass it on (or undo it)."""
+            text = var.get().strip().rstrip("%").strip()
+            try:
+                n = 0 if allow_off and text.lower() in ("off", "0") else int(text)
+            except ValueError:
+                n = None
+            if n is None or not (0 if allow_off else 1) <= n <= 99 or on_pick(n) is False:
+                var.set(label(box.current_level))       # refused: put the old value back
+                return
+            box.current_level = n
+            var.set(label(n))
+
+        box.bind("<<ComboboxSelected>>", commit)
+        return box
+
+    # ---- layout: title, tabs, page area, bottom bar
+    tk.Label(root, text="Battery Alerts", font=F(1.4, True), bg=BG, fg=FG).pack(pady=(u * 0.5, u * 0.3))
+    tabs = tk.Frame(root, bg=BG)
+    tabs.pack()
+    page_area = tk.Frame(root, bg=BG)
+    page_area.pack(fill="both", expand=True, padx=u, pady=(u * 0.4, 0))
+    bottom = tk.Frame(root, bg=BG)
+    bottom.pack(fill="x", padx=u, pady=u * 0.5)
+    status = tk.Label(bottom, text="", font=F(0.75), bg=BG, fg=DIM, anchor="w", justify="left",
+                      wraplength=w - u * 22)
+    status.pack(side="left", fill="x", expand=True)
+
+    # ---- level list page (shared by "On battery" and "Charging")
+    lists = {"battery": [], "charging": []}   # rows: {"level": IntVar, "message": StringVar}
+
+    def make_list_page(name, intro, shared_default, new_level):
+        """Build an editable list of levels ("battery" or "charging"): intro
+        text, a scrollable row per level, and an "Add level" button.
+        `new_level(taken)` picks the level for a newly added row."""
+        page = tk.Frame(page_area, bg=BG)
+        tk.Label(page, text=intro, font=F(0.8), bg=BG, fg=DIM, wraplength=w - u * 3,
+                 justify="left").pack(anchor="w")
+        # Scrollable area for the rows.
+        box = tk.Frame(page, bg=BG)
+        box.pack(fill="both", expand=True, pady=(u * 0.3, 0))
+        canvas = tk.Canvas(box, bg=BG, highlightthickness=0)
+        bar = tk.Scrollbar(box, orient="vertical", command=canvas.yview, bg=CARD,
+                           troughcolor=BG, activebackground=DIM, highlightthickness=0, bd=0)
+        rows_frame = tk.Frame(canvas, bg=BG)
+        rows_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win = canvas.create_window((0, 0), window=rows_frame, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        scroll_areas.append(canvas)             # mouse-wheel scrolling, see wheel()
+
+        def redraw():
+            """Rebuild the rows from lists[name], sorted the way they fire."""
+            for child in rows_frame.winfo_children():
+                child.destroy()
+            rows = lists[name]
+            rows.sort(key=lambda r: r["level"].get(), reverse=(name == "battery"))
+            if not rows:
+                tk.Label(rows_frame, text="No alerts. Use “Add level” to create one.",
+                         font=F(0.85), bg=BG, fg=DIM).pack(anchor="w", pady=u * 0.5)
+            for r in rows:
+                line = tk.Frame(rows_frame, bg=BG)
+                line.pack(fill="x", pady=u * 0.15)
+                # level dropdown
+                level_picker(line, r["level"].get(), lambda n, r=r: pick(r, n)).pack(side="left")
+                # remove, test, message
+                btn(line, "✕", lambda r=r: remove(r), fg=BAD).pack(side="right", padx=(u * 0.2, 0))
+                btn(line, "▶", lambda r=r: play(r["message"].get, r["level"].get),
+                    color=ACC, fg="white").pack(side="right", padx=(u * 0.3, 0))
+                entry(line, r["message"]).pack(side="left", fill="x", expand=True, padx=(u * 0.4, 0),
+                                              ipady=u * 0.2)
+
+        def pick(r, n):
+            """A new level chosen in a row's dropdown. Refused if another row
+            already uses it; otherwise the list is re-sorted."""
+            if n == r["level"].get():
+                return True
+            if any(o["level"].get() == n for o in lists[name] if o is not r):
+                status.config(text=f"{n}% is already in this list.", fg=BAD)
+                return False
+            r["level"].set(n)
+            mark_dirty()
+            root.after_idle(redraw)     # re-sort after the dropdown has closed
+            return True
+
+        def remove(r):
+            """Delete one alert row (the ✕ button)."""
+            lists[name].remove(r)
+            mark_dirty()
+            redraw()
+
+        def add():
+            """Add a level at a free spot near where new alerts usually go."""
+            taken = {o["level"].get() for o in lists[name]}
+            lvl = new_level(taken)
+            if lvl is None:
+                status.config(text="No free level left between 1% and 99%.", fg=BAD)
+                return
+            lists[name].append(new_row(lvl, shared_default))
+            mark_dirty()
+            redraw()
+
+        btn(page, "+ Add level", add, size=0.85, width=11).pack(anchor="w", pady=(u * 0.4, 0))
+        page.redraw = redraw
+        return page
+
+    def new_row(level, message):
+        """Variables for one list row: its level and message."""
+        return {"level": tk.IntVar(value=level), "message": tk.StringVar(value=message)}
+
+    def free_below(taken):      # on battery: 10 below the lowest, else 50
+        """First free level at or above the suggestion, else below it."""
+        start = (min(taken) - 10) if taken else 50
+        for lvl in list(range(max(start, 1), 100)) + list(range(max(start, 1) - 1, 0, -1)):
+            if lvl not in taken:
+                return lvl
+        return None
+
+    def free_above(taken):      # charging: 10 above the highest, else 80
+        """First free level at or below the suggestion, else above it."""
+        start = (max(taken) + 10) if taken else 80
+        for lvl in list(range(min(start, 99), 0, -1)) + list(range(min(start, 99) + 1, 100)):
+            if lvl not in taken:
+                return lvl
+        return None
+
+    # Mouse-wheel scrolling for the level lists: scroll whichever list the
+    # pointer is over (and nothing while the pointer is in a dropdown pop-up).
+    scroll_areas = []
+
+    def wheel(e, d):
+        """Scroll the level list under the pointer, if any."""
+        path = str(e.widget)
+        for c in scroll_areas:
+            if path.startswith(str(c)):
+                c.yview_scroll(d, "units")
+                return
+
+    root.bind_all("<Button-4>", lambda e: wheel(e, -1))         # X11 wheel up
+    root.bind_all("<Button-5>", lambda e: wheel(e, 1))          # X11 wheel down
+    root.bind_all("<MouseWheel>", lambda e: wheel(e, -1 if e.delta > 0 else 1))
+
+    cfg_now = load_config()
+    pages = {}
+    pages["battery"] = make_list_page(
+        "battery",
+        "Spoken once each as the battery drops to the level. {p} = percent. "
+        "A message left as “" + cfg_now["phrases"]["level"] + "” keeps following the default.",
+        cfg_now["phrases"]["level"], free_below)
+    pages["charging"] = make_list_page(
+        "charging",
+        "Spoken once each as the battery charges up to the level. {p} = percent. "
+        "Fully charged (100%) is set on the Charger Plugin Status page.",
+        cfg_now["phrases"]["charge_level"], free_above)
+
+    # ---- "Low battery" page: countdown start, critical level and their messages
+    nums = {"low_below": tk.IntVar(), "critical_at": tk.IntVar()}
+    phrase_vars = {k: tk.StringVar() for k in ALERT_PHRASES}
+    switch_vars = {k: tk.BooleanVar() for k in CHARGER_SWITCHES}
+    for v in list(nums.values()) + list(switch_vars.values()):
+        v.trace_add("write", mark_dirty)
+
+    def number_setting(parent, var, label):
+        """A caption with a level dropdown (including "Off") bound to `var`.
+        Returns a function that refreshes the dropdown after `var` is loaded."""
+        line = tk.Frame(parent, bg=BG)
+        line.pack(fill="x", pady=(u * 0.5, u * 0.15))
+        tk.Label(line, text=label, font=F(0.9, True), bg=BG, fg=FG).pack(side="left", padx=(0, u * 0.5))
+        holder = tk.Frame(line, bg=BG)
+        holder.pack(side="left")
+
+        def refresh():
+            """Rebuild the dropdown so it shows the current value of `var`."""
+            for child in holder.winfo_children():
+                child.destroy()
+            level_picker(holder, var.get(), lambda n: var.set(n), allow_off=True).pack()
+        return refresh
+
+    def message_line(parent, key, level_fn, label=None):
+        """A message box with a ▶ test button (and an optional caption)."""
+        if label:
+            tk.Label(parent, text=label, font=F(0.75), bg=BG, fg=DIM).pack(anchor="w", pady=(u * 0.2, 0))
+        line = tk.Frame(parent, bg=BG)
+        line.pack(fill="x")
+        btn(line, "▶", lambda: play(phrase_vars[key].get, level_fn),
+            color=ACC, fg="white").pack(side="right", padx=(u * 0.3, 0))
+        entry(line, phrase_vars[key]).pack(side="left", fill="x", expand=True, ipady=u * 0.2)
+
+    low = tk.Frame(page_area, bg=BG)
+    tk.Label(low, text="Below the countdown level every 1% drop is spoken. {p} = percent.",
+             font=F(0.8), bg=BG, fg=DIM, wraplength=w - u * 3, justify="left").pack(anchor="w")
+    upd_low = number_setting(low, nums["low_below"], "Count down every 1% below")
+    message_line(low, "low", lambda: max(1, nums["low_below"].get() - 1), "Countdown message")
+    upd_crit = number_setting(low, nums["critical_at"], "“Critical” wording at or below")
+    message_line(low, "critical", lambda: max(1, nums["critical_at"].get()), "Critical message")
+    pages["low"] = low
+
+    # ---- "Charger" page: on/off switches and messages
+    chg = tk.Frame(page_area, bg=BG)
+    tk.Label(chg, text="{p} = percent, {eta} = the time-to-full sentence, {t} = the time.",
+             font=F(0.8), bg=BG, fg=DIM).pack(anchor="w")
+
+    def switch(parent, key, text):
+        """A caption with a large On/Off button (easier to hit in VR than a tick box)."""
+        line = tk.Frame(parent, bg=BG)
+        line.pack(fill="x", pady=(u * 0.5, u * 0.1))
+        b = btn(line, "", lambda: switch_vars[key].set(not switch_vars[key].get()), width=4, size=0.8)
+        b.pack(side="left")
+        tk.Label(line, text=text, font=F(0.9, True), bg=BG, fg=FG).pack(side="left", padx=u * 0.4)
+        def upd(*_):
+            """Show the switch as a green On or a grey Off."""
+            on = switch_vars[key].get()
+            b.config(text="On" if on else "Off", bg=OK if on else CARD, fg="white" if on else DIM)
+        switch_vars[key].trace_add("write", upd)
+
+    switch(chg, "plug_in", "Announce when plugged in")
+    message_line(chg, "plug_in", lambda: 62)
+    message_line(chg, "plug_in_eta", lambda: 62, "Time-to-full part ({eta} above)")
+    message_line(chg, "plug_in_full", lambda: 100, "If already full when plugged in")
+    switch(chg, "unplug", "Announce when unplugged")
+    message_line(chg, "unplug", lambda: 98)
+    switch(chg, "full", "Announce when fully charged")
+    message_line(chg, "full", lambda: 100)
+    pages["charger"] = chg
+
+    # ---- load a settings dict into the widgets / read it back out
+    def load(m):
+        """Put a settings dict (see alert_settings) into every widget."""
+        for name in ("battery", "charging"):
+            lists[name][:] = [new_row(a["level"], a["message"]) for a in m[name]]
+            pages[name].redraw()
+        nums["low_below"].set(m["low_below"])
+        nums["critical_at"].set(m["critical_at"])
+        for k in ALERT_PHRASES:
+            phrase_vars[k].set(m["phrases"][k])
+        for k in CHARGER_SWITCHES:
+            switch_vars[k].set(m["switches"][k])
+        upd_low(); upd_crit()
+
+    def collect():
+        """Read every widget back into a settings dict for saving."""
+        return {
+            "battery": [{"level": r["level"].get(), "message": r["message"].get()} for r in lists["battery"]],
+            "charging": [{"level": r["level"].get(), "message": r["message"].get()} for r in lists["charging"]],
+            "low_below": nums["low_below"].get(),
+            "critical_at": nums["critical_at"].get(),
+            "phrases": {k: v.get() for k, v in phrase_vars.items()},
+            "switches": {k: v.get() for k, v in switch_vars.items()},
+        }
+
+    # ---- tabs
+    tab_buttons = {}
+
+    def show(name):
+        """Switch to a page and highlight its tab."""
+        if state["page"]:
+            pages[state["page"]].pack_forget()
+        pages[name].pack(fill="both", expand=True)
+        state["page"] = name
+        for n, b in tab_buttons.items():
+            b.config(bg=ACC if n == name else CARD, fg="white" if n == name else FG)
+
+    for name, label in (("battery", "On battery"), ("low", "Low battery"),
+                        ("charging", "Charging"), ("charger", "Charger Plugin Status")):
+        tab_buttons[name] = btn(tabs, label, lambda n=name: show(n), width=len(label) + 1)
+        tab_buttons[name].pack(side="left", padx=u * 0.2)
+
+    # ---- bottom bar: Defaults / Close / Save
+    def save():
+        """Validate and save; problems are shown in the status line instead."""
+        errors = save_alert_settings(collect())
+        if errors:
+            status.config(text="Not saved: " + "; ".join(errors), fg=BAD)
+            return
+        state["dirty"] = False
+        status.config(text="Saved. The announcer uses the new alerts within a few seconds.", fg=OK)
+        _speak_async("Alert settings saved.")
+        load(alert_settings(load_config()))     # show them as stored (sorted, defaults filled)
+        state["dirty"] = False
+        status.config(text="Saved. The announcer uses the new alerts within a few seconds.", fg=OK)
+
+    def restore_defaults():
+        """Show the factory settings; they're only kept if Save is pressed."""
+        load(defaults)
+        status.config(text="Defaults loaded. Press Save to keep them.", fg=DIM)
+
+    btn(bottom, "Save", save, color=ACC, fg="white", width=7, size=1.0).pack(side="right", padx=(u * 0.4, 0))
+    btn(bottom, "Close", root.destroy, width=7, size=1.0).pack(side="right", padx=(u * 0.4, 0))
+    btn(bottom, "Defaults", restore_defaults, width=8, size=0.8, fg=DIM).pack(side="right")
+
+    root.bind("<Escape>", lambda e: root.destroy())
+    load(model)
+    state["dirty"] = False
+    status.config(text="Changes apply when you press Save.", fg=DIM)
+    show(os.environ.get("BATTERY_ANNOUNCE_PAGE", "battery"))
+    if os.environ.get("BATTERY_ANNOUNCE_SCREENSHOT"):   # for testing: auto-close after N ms
+        root.after(int(os.environ.get("BATTERY_ANNOUNCE_SCREENSHOT")), root.destroy)
+    root.mainloop()
+    return 0
+
+
+# ---------------------------------------------------------------- entry point
+
+def main(argv):
+    """Dispatch the command-line verb (see the docstring at the top)."""
+    cmd = argv[1] if len(argv) > 1 else "run"
+    if cmd == "run":
+        cmd_run()
+        return 0
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "calibrate" and len(argv) > 2:
+        return cmd_calibrate(argv[2])
+    if cmd in ("calibrate-gui", "calibrate") and len(argv) == 2:
+        return cmd_calibrate_gui()      # `calibrate` with no number opens the window
+    if cmd == "reset-calibration":
+        return cmd_reset_calibration()
+    if cmd == "say" and len(argv) > 2:
+        speak(" ".join(argv[2:]), load_config(), cacheable=False)
+        return 0
+    if cmd == "test":
+        return cmd_test()
+    if cmd == "now":
+        return cmd_now()
+    if cmd in ("on", "off", "toggle"):
+        return cmd_set_enabled({"on": True, "off": False, "toggle": None}[cmd])
+    if cmd == "alerts-gui":
+        return cmd_alerts_gui()
+    if cmd == "alerts":
+        return cmd_alerts(argv[2:])
+    print(__doc__)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
