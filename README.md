@@ -1,7 +1,8 @@
 # SteamFrame-Tools
 A collection of open source tools for the Steam Frame shared to my fellow enthusiast.
 
-No elevated permissions needed, no developer mode required.  All these toolsets work with vanilla install of SteamOS but in theory should work with any Linux distribution.
+**No elevated permissions needed, no developer mode required.  **
+All these toolsets work with vanilla install of SteamOS with setup in Desktop mode and control done from Non-Steam Game links added but in theory should work with any Linux distribution.
 
 Currently these are the following tools added:
 battery-announce:   This software service allows you to setup audio alarms for when your battery reaches certain values after the initial calibrations.
